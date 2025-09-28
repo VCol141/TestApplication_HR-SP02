@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center_horizontal"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <Button
+        android:id="@+id/btnStart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Start BLE" />
+
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Status: Idle"
+        android:paddingTop="16dp"
+        android:textSize="16sp"/>
+
+    <TextView
+        android:id="@+id/tvHr"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="HR: --"
+        android:textSize="24sp"
+        android:paddingTop="16dp"/>
+
+    <TextView
+        android:id="@+id/tvSpo2"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="SpO₂: --%"
+        android:textSize="24sp"
+        android:paddingTop="8dp"/>
+</LinearLayout>
