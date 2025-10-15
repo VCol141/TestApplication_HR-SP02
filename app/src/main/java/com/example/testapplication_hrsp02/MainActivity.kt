@@ -31,6 +31,51 @@ import java.io.IOException
 import java.util.*
 import kotlin.math.min
 
+// ---------- Supabase ----------
+import io.github.jan.supabase.createSupabaseClient
+import io.github.jan.supabase.postgrest.Postgrest
+import io.github.jan.supabase.gotrue.Auth
+import io.github.jan.supabase.postgrest.from
+import kotlinx.serialization.Serializable
+
+// Continuous uploader
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.withTimeoutOrNull
+
+// Initializes Supabase once; reads URL/KEY from build.gradle BuildConfig fields
+object SupabaseProvider {
+    private const val URL = BuildConfig.SUPABASE_URL
+    private const val KEY = BuildConfig.SUPABASE_ANON_KEY
+
+    val client = createSupabaseClient(
+        supabaseUrl = URL,
+        supabaseKey = KEY // anon key only; never service role in mobile apps
+    ) {
+        install(Postgrest)
+        install(Auth)
+    }
+}
+
+// Row model matching your Supabase table (rename columns if your table differs)
+@Serializable
+data class HealthRow(
+    val timestamp: Long,
+    val heart_rate: Int,
+    val spo2: Int,
+    val device_name: String = "BLT_M70C"
+)
+
+// Bulk insert helper
+suspend fun insertManyHealth(rows: List<HealthRow>) {
+    if (rows.isEmpty()) return
+    SupabaseProvider.client
+        .from("health_readings")   // <-- change to your table name if needed
+        .insert(rows)              // bulk insert
+}
+
+// ===============================================================
+
 class MainActivity : ComponentActivity() {
 
     // ====== CONFIG ======
@@ -63,6 +108,13 @@ class MainActivity : ComponentActivity() {
     private var writerJob: Job? = null
     private var bleJob: Job? = null
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // ====== Continuous uploader ======
+    private var uploaderJob: Job? = null
+    private val uploadChan = Channel<HealthRow>(
+        capacity = 1000,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
 
     // ====== Subscription queue (enable notifications on multiple chars safely) ======
     private val descriptorQueue: ArrayDeque<Pair<BluetoothGattDescriptor, ByteArray>> = ArrayDeque()
@@ -109,8 +161,10 @@ class MainActivity : ComponentActivity() {
                     Text("Nearby (live):")
                     LazyColumn {
                         items(discoveredDevices) { d ->
-                            Text("• ${d.name ?: "(no name)"} — ${d.address ?: "unknown"} [RSSI ${d.rssi ?: "?"}]",
-                                Modifier.padding(top = 6.dp))
+                            Text(
+                                "• ${d.name ?: "(no name)"} — ${d.address ?: "unknown"} [RSSI ${d.rssi ?: "?"}]",
+                                Modifier.padding(top = 6.dp)
+                            )
                         }
                     }
                     Spacer(Modifier.height(8.dp))
@@ -162,6 +216,7 @@ class MainActivity : ComponentActivity() {
     private fun startEnvironment() {
         if (!ensureEnvReady()) return
         startCsvWriterIfNeeded()
+        startUploader()                 // <-- start continuous uploader
         startBleScanWindow()
     }
 
@@ -206,6 +261,7 @@ class MainActivity : ComponentActivity() {
             }.build()
 
         try {
+            @Suppress("UNCHECKED_CAST")
             bleScanner?.startScan(null as List<ScanFilter>?, settings, bleCallback)
             isScanningBle = true
             updateStatus("BLE scan…")
@@ -299,7 +355,6 @@ class MainActivity : ComponentActivity() {
                 updateStatus("Service discovery failed: $status"); return
             }
 
-            // Log all services/characteristics with props
             val sb = StringBuilder("Services/Chars:\n")
             gatt.services.forEach { svc ->
                 sb.append("  SVC ${svc.uuid}\n")
@@ -309,15 +364,12 @@ class MainActivity : ComponentActivity() {
             }
             Log.d(TAG, sb.toString())
 
-            // Pick set of NOTIFY/INDICATE chars (optionally prefer known ones)
             val notifyChars = mutableListOf<BluetoothGattCharacteristic>()
 
-            // If known service set, use it first
             val primaryService = knownServiceUuid?.let { gatt.getService(it) }
             if (primaryService != null) {
                 notifyChars += primaryService.characteristics.filter { hasNotifyOrIndicate(it) }
             }
-            // Fallback: add all remaining notify/indicate across all services
             gatt.services.forEach { svc ->
                 svc.characteristics.forEach { ch ->
                     if (hasNotifyOrIndicate(ch) && notifyChars.none { it.uuid == ch.uuid }) {
@@ -330,7 +382,6 @@ class MainActivity : ComponentActivity() {
                 updateStatus("No notify/indicate characteristics found"); return
             }
 
-            // If known char specified, move it to front
             knownNotifyCharUuid?.let { knownUuid ->
                 val idx = notifyChars.indexOfFirst { it.uuid == knownUuid }
                 if (idx >= 0) {
@@ -339,7 +390,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Enable notifications on ALL candidates using a descriptor write queue
             subscribedCharUuids.clear()
             descriptorQueue.clear()
             for (ch in notifyChars) {
@@ -379,17 +429,14 @@ class MainActivity : ComponentActivity() {
                     Log.w(TAG, "CCCD write failed ($status) -> $chUuid")
                 }
             }
-            // Continue the queue
             writeNextDescriptor(gatt)
         }
 
-        // Android 12 and below callback
         @Deprecated("Still used on many devices")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             handleNotify(characteristic, characteristic.value ?: return)
         }
 
-        // Android 13+ callback
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             handleNotify(characteristic, value)
         }
@@ -406,13 +453,12 @@ class MainActivity : ComponentActivity() {
         desc.value = value
         if (!gatt.writeDescriptor(desc)) {
             Log.w(TAG, "writeDescriptor failed immediately -> ${desc.characteristic.uuid}")
-            writeNextDescriptor(gatt) // skip and continue
+            writeNextDescriptor(gatt)
         }
     }
 
     // ===== Parse + logging =====
     private fun handleNotify(ch: BluetoothGattCharacteristic, bytes: ByteArray) {
-        // Debug hex (first up to 32 bytes)
         val n = min(bytes.size, 32)
         val hex = (0 until n).joinToString(" ") { i -> String.format("%02X", bytes[i]) }
         Log.d(TAG, "NOTIFY ${ch.uuid} len=${bytes.size} data=$hex")
@@ -421,7 +467,15 @@ class MainActivity : ComponentActivity() {
         val (hr, spo2) = parsed
         hrState = hr.toString()
         spo2State = spo2.toString()
-        buffer.add(Triple(System.currentTimeMillis() / 1000L, hr, spo2))
+
+        // Timestamp once
+        val now = System.currentTimeMillis() / 1000L
+
+        // Keep CSV buffer
+        buffer.add(Triple(now, hr, spo2))
+
+        // Enqueue for continuous upload (non-blocking)
+        uploadChan.trySend(HealthRow(timestamp = now, heart_rate = hr, spo2 = spo2))
     }
 
     private fun hasNotifyOrIndicate(ch: BluetoothGattCharacteristic): Boolean {
@@ -455,8 +509,9 @@ class MainActivity : ComponentActivity() {
         } else null
     }
 
-    // ===== CSV =====
+    // ===== CSV + Supabase (batch on disk, continuous via channel) =====
     private fun csvFile(): File = File(getExternalFilesDir(null), "health_data.csv")
+
     private fun ensureCsvHeader() {
         val f = csvFile()
         if (f.exists()) return
@@ -465,22 +520,70 @@ class MainActivity : ComponentActivity() {
             FileWriter(f, false).use { it.appendLine("timestamp,heart_rate,spo2") }
         } catch (e: IOException) { Log.e(TAG, "CSV header write failed", e) }
     }
+
     private fun flushBufferToCsv() {
         val snapshot = mutableListOf<Triple<Long, Int, Int>>()
         synchronized(buffer) {
             if (buffer.isEmpty()) return
             snapshot.addAll(buffer); buffer.clear()
         }
+
+        // Write CSV
         try {
-            FileWriter(csvFile(), true).use { w -> snapshot.forEach { (ts, hr, spo2) -> w.appendLine("$ts,$hr,$spo2") } }
+            FileWriter(csvFile(), true).use { w ->
+                snapshot.forEach { (ts, hr, spo2) -> w.appendLine("$ts,$hr,$spo2") }
+            }
             Log.d(TAG, "CSV appended ${snapshot.size} rows.")
         } catch (e: IOException) { Log.e(TAG, "CSV write failed", e) }
+
+        // ALSO send the same batch to Supabase (safety net)
+        ioScope.launch {
+            val rows = snapshot.map { (ts, hr, sp) -> HealthRow(ts, hr, sp) }
+            runCatching { insertManyHealth(rows) }
+                .onSuccess { Log.d(TAG, "Supabase: inserted ${rows.size} rows") }
+                .onFailure { err -> Log.w(TAG, "Supabase insert failed: ${err.message}", err) }
+        }
     }
+
     private fun startCsvWriterIfNeeded() {
         if (writerJob == null || writerJob?.isCancelled == true) {
             writerJob = ioScope.launch {
                 ensureCsvHeader()
-                while (isActive) { delay(WRITE_INTERVAL_SEC * 1000L); flushBufferToCsv() }
+                while (isActive) {
+                    delay(WRITE_INTERVAL_SEC * 1000L)
+                    flushBufferToCsv()
+                }
+            }
+        }
+    }
+
+    // ===== Continuous uploader (flush every few seconds or max batch) =====
+    private fun startUploader() {
+        if (uploaderJob?.isActive == true) return
+        uploaderJob = ioScope.launch {
+            val batch = mutableListOf<HealthRow>()
+            val FLUSH_MS = 3000L
+            val MAX_BATCH = 50
+            var lastFlush = System.currentTimeMillis()
+
+            while (isActive) {
+                val remaining = FLUSH_MS - (System.currentTimeMillis() - lastFlush)
+                val item = withTimeoutOrNull(if (remaining > 0) remaining else 1L) {
+                    uploadChan.receive()
+                }
+                if (item != null) batch += item
+
+                val timeFlush = System.currentTimeMillis() - lastFlush >= FLUSH_MS
+                val sizeFlush = batch.size >= MAX_BATCH
+
+                if ((timeFlush || sizeFlush) && batch.isNotEmpty()) {
+                    val toSend = batch.toList()
+                    batch.clear()
+                    lastFlush = System.currentTimeMillis()
+                    runCatching { insertManyHealth(toSend) }
+                        .onSuccess { Log.d(TAG, "Supabase: sent ${toSend.size} rows") }
+                        .onFailure { e -> Log.w(TAG, "Supabase batch failed: ${e.message}", e) }
+                }
             }
         }
     }
@@ -495,6 +598,7 @@ class MainActivity : ComponentActivity() {
         safeCloseGatt()
         writerJob?.cancel()
         bleJob?.cancel()
+        uploaderJob?.cancel()      // <-- stop uploader
         ioScope.cancel()
     }
 

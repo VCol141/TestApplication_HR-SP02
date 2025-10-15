@@ -1,8 +1,12 @@
+// app/build.gradle.kts
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+
+    id("org.jetbrains.kotlin.plugin.serialization") version "2.0.20" // <-- match your Kotlin version
 }
+
 
 android {
     namespace = "com.example.testapplication_hrsp02"
@@ -16,6 +20,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "SUPABASE_URL", "\"https://gkflkpkigozqmlkivnqi.supabase.co\"")
+        buildConfigField("String", "SUPABASE_ANON_KEY", "\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdrZmxrcGtpZ296cW1sa2l2bnFpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg3NzQ4MTEsImV4cCI6MjA3NDM1MDgxMX0.CCC0wK27g7RnfOoZFsH-9BoDA3ZSLmsP96Wsz6GI8do\"")
     }
 
     buildTypes {
@@ -35,6 +42,7 @@ android {
         jvmTarget = "11"
     }
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 }
@@ -56,4 +64,13 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+
+    // Supabase Kotlin BOM + modules you need
+    implementation(platform("io.github.jan-tennert.supabase:bom:2.4.0"))
+    implementation("io.github.jan-tennert.supabase:postgrest-kt")
+    implementation("io.github.jan-tennert.supabase:gotrue-kt") // ← correct
+    implementation("io.ktor:ktor-client-okhttp:2.3.12")
+
+    // Ktor HTTP engine (required by supabase-kt)
+    implementation("io.ktor:ktor-client-okhttp:2.3.12")
 }
