@@ -21,8 +21,12 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        buildConfigField("String", "SUPABASE_URL", "\"https://gkflkpkigozqmlkivnqi.supabase.co\"")
-        buildConfigField("String", "SUPABASE_ANON_KEY", "\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdrZmxrcGtpZ296cW1sa2l2bnFpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg3NzQ4MTEsImV4cCI6MjA3NDM1MDgxMX0.CCC0wK27g7RnfOoZFsH-9BoDA3ZSLmsP96Wsz6GI8do\"")
+        val properties = java.util.Properties().apply {
+            load(rootProject.file("local.properties").inputStream())
+        }
+
+        buildConfigField("String", "SUPABASE_URL", "\"${properties.getProperty("supabase.url")}\"")
+        buildConfigField("String", "SUPABASE_ANON_KEY", "\"${properties.getProperty("supabase.anon.key")}\"")
     }
 
     buildTypes {

@@ -57,21 +57,34 @@ object SupabaseProvider {
     }
 }
 
-// Row model matching your Supabase table (rename columns if your table differs)
-@Serializable
-data class HealthRow(
-    val timestamp: Long,
-    val heart_rate: Int,
-    val spo2: Int,
-    val device_name: String = "BLT_M70C"
-)
+// Import models
+import com.example.testapplication_hrsp02.data.*
+import java.util.UUID
+
+// Session management
+private var currentSession: SessionResponse? = null
+
+// Create a new session
+private suspend fun createSession(): SessionResponse? {
+    return try {
+        val sessionKey = UUID.randomUUID().toString()
+        val session = Session(session_key = sessionKey)
+        SupabaseProvider.client
+            .from("sessions")
+            .insert(session)
+            .decodeSingle<SessionResponse>()
+    } catch (e: Exception) {
+        Log.e("Session", "Failed to create session", e)
+        null
+    }
+}
 
 // Bulk insert helper
-suspend fun insertManyHealth(rows: List<HealthRow>) {
+private suspend fun insertManyHealth(rows: List<HealthData>) {
     if (rows.isEmpty()) return
     SupabaseProvider.client
-        .from("health_readings")   // <-- change to your table name if needed
-        .insert(rows)              // bulk insert
+        .from("health_data")
+        .insert(rows)
 }
 
 // ===============================================================
@@ -111,7 +124,7 @@ class MainActivity : ComponentActivity() {
 
     // ====== Continuous uploader ======
     private var uploaderJob: Job? = null
-    private val uploadChan = Channel<HealthRow>(
+    private val uploadChan = Channel<Pair<Int, Int>>(  // (pulse, spo2)
         capacity = 1000,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
@@ -215,9 +228,17 @@ class MainActivity : ComponentActivity() {
 
     private fun startEnvironment() {
         if (!ensureEnvReady()) return
-        startCsvWriterIfNeeded()
-        startUploader()                 // <-- start continuous uploader
-        startBleScanWindow()
+        
+        ioScope.launch {
+            currentSession = createSession()
+            if (currentSession == null) {
+                updateStatus("Failed to create session")
+                return@launch
+            }
+            startCsvWriterIfNeeded()
+            startUploader()
+            startBleScanWindow()
+        }
     }
 
     // ===== UI actions =====
@@ -474,8 +495,11 @@ class MainActivity : ComponentActivity() {
         // Keep CSV buffer
         buffer.add(Triple(now, hr, spo2))
 
-        // Enqueue for continuous upload (non-blocking)
-        uploadChan.trySend(HealthRow(timestamp = now, heart_rate = hr, spo2 = spo2))
+        // Only upload if we have an active session
+        if (currentSession != null) {
+            // Enqueue for continuous upload (non-blocking)
+            uploadChan.trySend(hr to spo2)
+        }
     }
 
     private fun hasNotifyOrIndicate(ch: BluetoothGattCharacteristic): Boolean {
@@ -561,7 +585,7 @@ class MainActivity : ComponentActivity() {
     private fun startUploader() {
         if (uploaderJob?.isActive == true) return
         uploaderJob = ioScope.launch {
-            val batch = mutableListOf<HealthRow>()
+            val batch = mutableListOf<HealthData>()
             val FLUSH_MS = 3000L
             val MAX_BATCH = 50
             var lastFlush = System.currentTimeMillis()
@@ -571,7 +595,16 @@ class MainActivity : ComponentActivity() {
                 val item = withTimeoutOrNull(if (remaining > 0) remaining else 1L) {
                     uploadChan.receive()
                 }
-                if (item != null) batch += item
+                
+                if (item != null && currentSession != null) {
+                    val (pulse, spo2) = item
+                    batch += HealthData(
+                        session_id = currentSession!!.id,
+                        timestamp = System.currentTimeMillis() / 1000L,
+                        pulse = pulse,
+                        spo2 = spo2
+                    )
+                }
 
                 val timeFlush = System.currentTimeMillis() - lastFlush >= FLUSH_MS
                 val sizeFlush = batch.size >= MAX_BATCH
