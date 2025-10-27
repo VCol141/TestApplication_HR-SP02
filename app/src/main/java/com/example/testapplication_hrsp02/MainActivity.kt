@@ -65,26 +65,36 @@ import java.util.UUID
 private var currentSession: SessionResponse? = null
 
 // Create a new session
-private suspend fun createSession(): SessionResponse? {
-    return try {
-        val sessionKey = UUID.randomUUID().toString()
-        val session = Session(session_key = sessionKey)
-        SupabaseProvider.client
-            .from("sessions")
-            .insert(session)
-            .decodeSingle<SessionResponse>()
-    } catch (e: Exception) {
-        Log.e("Session", "Failed to create session", e)
-        null
-    }
-}
-
-// Bulk insert helper
+    private suspend fun createSession(): SessionResponse? {
+        return try {
+            val sessionKey = UUID.randomUUID().toString()
+            Log.d(TAG, "Creating new session with key: $sessionKey")
+            
+            val session = Session(session_key = sessionKey)
+            val response = SupabaseProvider.client
+                .from("sessions")
+                .insert(session)
+                .decodeSingle<SessionResponse>()
+            
+            Log.d(TAG, "Session created successfully with ID: ${response.id}")
+            response
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create session: ${e.message}", e)
+            null
+        }
+    }// Bulk insert helper
 private suspend fun insertManyHealth(rows: List<HealthData>) {
     if (rows.isEmpty()) return
-    SupabaseProvider.client
-        .from("health_data")
-        .insert(rows)
+    try {
+        Log.d(TAG, "Inserting ${rows.size} health records. First record: ${rows.firstOrNull()}")
+        SupabaseProvider.client
+            .from("health_data")
+            .insert(rows)
+        Log.d(TAG, "Successfully inserted ${rows.size} health records")
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to insert health data: ${e.message}", e)
+        throw e  // Re-throw to be caught by caller
+    }
 }
 
 // ===============================================================
@@ -497,8 +507,15 @@ class MainActivity : ComponentActivity() {
 
         // Only upload if we have an active session
         if (currentSession != null) {
+            Log.d(TAG, "Enqueueing data: HR=$hr, SpO2=$spo2")
             // Enqueue for continuous upload (non-blocking)
-            uploadChan.trySend(hr to spo2)
+            uploadChan.trySend(hr to spo2).also { result ->
+                if (!result.isSuccess) {
+                    Log.w(TAG, "Failed to enqueue data: ${result.exceptionOrNull()?.message}")
+                }
+            }
+        } else {
+            Log.w(TAG, "No active session, skipping upload of HR=$hr, SpO2=$spo2")
         }
     }
 
