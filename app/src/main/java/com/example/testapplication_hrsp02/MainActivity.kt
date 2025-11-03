@@ -11,6 +11,12 @@ import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import kotlinx.serialization.json.Json
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -31,19 +37,64 @@ import java.io.IOException
 import java.util.*
 import kotlin.math.min
 
-// ---------- Supabase ----------
-import io.github.jan.supabase.createSupabaseClient
-import io.github.jan.supabase.postgrest.Postgrest
-import io.github.jan.supabase.gotrue.Auth
-import io.github.jan.supabase.postgrest.from
 import kotlinx.serialization.Serializable
-
-// Continuous uploader
+import kotlinx.serialization.json.Json
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.IOException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.withTimeoutOrNull
 
-// Initializes Supabase once; reads URL/KEY from build.gradle BuildConfig fields
+// Backend configuration
+object BackendConfig {
+    const val BASE_URL = "https://tele-oximeter-backend-development.up.railway.app"
+    private val client = OkHttpClient()
+    private val json = Json { ignoreUnknownKeys = true }
+    
+    fun createSession(): SessionResponse? {
+        val request = Request.Builder()
+            .url("$BASE_URL/sessions")
+            .post("".toRequestBody("application/json".toMediaType()))
+            .build()
+            
+        return try {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("Unexpected code $response")
+                response.body?.string()?.let { json.decodeFromString<SessionResponse>(it) }
+            }
+        } catch (e: Exception) {
+            Log.e("Backend", "Failed to create session: ${e.message}", e)
+            null
+        }
+    }
+    
+    fun uploadHealthData(data: List<HealthData>): Boolean {
+        val jsonData = json.encodeToString(HealthData.serializer().list, data)
+        val request = Request.Builder()
+            .url("$BASE_URL/health-data")
+            .post(jsonData.toRequestBody("application/json".toMediaType()))
+            .build()
+            
+        return try {
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
+        } catch (e: Exception) {
+            Log.e("Backend", "Failed to upload health data: ${e.message}", e)
+            false
+        }
+    }
+}
+
+// Supabase configuration
+import io.github.jan.supabase.createSupabaseClient
+import io.github.jan.supabase.postgrest.Postgrest
+import io.github.jan.supabase.gotrue.Auth
+import io.github.jan.supabase.postgrest.from
+
+// Initializes Supabase for data storage
 object SupabaseProvider {
     private const val URL = BuildConfig.SUPABASE_URL
     private const val KEY = BuildConfig.SUPABASE_ANON_KEY
@@ -66,27 +117,38 @@ private var currentSession: SessionResponse? = null
 
 // Create a new session
     private suspend fun createSession(): SessionResponse? {
-        return try {
-            val sessionKey = UUID.randomUUID().toString()
-            Log.d(TAG, "Creating new session with key: $sessionKey")
-            
-            val session = Session(session_key = sessionKey)
-            val response = SupabaseProvider.client
-                .from("sessions")
-                .insert(session)
-                .decodeSingle<SessionResponse>()
-            
-            Log.d(TAG, "Session created successfully with ID: ${response.id}")
-            response
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to create session: ${e.message}", e)
-            null
+        return withContext(Dispatchers.IO) {
+            try {
+                // Request session from Railway backend
+                val client = OkHttpClient()
+                val request = Request.Builder()
+                    .url("https://tele-oximeter-backend-development.up.railway.app/sessions")
+                    .post("".toRequestBody("application/json".toMediaType()))
+                    .build()
+                
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw IOException("Unexpected code $response")
+                    
+                    // Parse the response
+                    response.body?.string()?.let { 
+                        Json { ignoreUnknownKeys = true }.decodeFromString<SessionResponse>(it)
+                    } ?: throw IOException("Empty response body")
+                }.also { response ->
+                    Log.d(TAG, "Session created successfully with key: ${response.session_key}")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create session: ${e.message}", e)
+                null
+            }
         }
-    }// Bulk insert helper
+    }
+
+// Bulk insert helper
 private suspend fun insertManyHealth(rows: List<HealthData>) {
     if (rows.isEmpty()) return
     try {
         Log.d(TAG, "Inserting ${rows.size} health records. First record: ${rows.firstOrNull()}")
+        // Use Supabase for data upload
         SupabaseProvider.client
             .from("health_data")
             .insert(rows)
@@ -121,6 +183,7 @@ class MainActivity : ComponentActivity() {
     private var spo2State by mutableStateOf("--")
     private var isScanningBle by mutableStateOf(false)
     private var scanEvents by mutableStateOf(0)
+    private var sessionKey by mutableStateOf("")
     private val discoveredDevices = mutableStateListOf<DiscoveredDevice>()
     private val seenKeys = Collections.synchronizedSet(mutableSetOf<String>())
 
@@ -165,6 +228,12 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.padding(16.dp)) {
                     Text(status)
                     Spacer(Modifier.height(8.dp))
+                    
+                    if (sessionKey.isNotBlank()) {
+                        Text("Session Key: $sessionKey")
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    
                     Row {
                         Button(onClick = { refreshBle() }) { Text("Refresh BLE") }
                         Spacer(Modifier.width(10.dp))
@@ -245,6 +314,11 @@ class MainActivity : ComponentActivity() {
                 updateStatus("Failed to create session")
                 return@launch
             }
+            
+            // Store and display the session key
+            sessionKey = currentSession!!.session_key
+            updateStatus("Session created - Key: $sessionKey")
+            
             startCsvWriterIfNeeded()
             startUploader()
             startBleScanWindow()
