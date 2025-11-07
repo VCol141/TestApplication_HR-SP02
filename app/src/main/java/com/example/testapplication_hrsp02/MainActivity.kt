@@ -120,14 +120,20 @@ private var currentSession: SessionResponse? = null
         return withContext(Dispatchers.IO) {
             try {
                 // Request session from Railway backend
-                val client = OkHttpClient()
+                val client = OkHttpClient.Builder()
+                    .build()
                 val request = Request.Builder()
-                    .url("https://tele-oximeter-backend-development.up.railway.app/sessions")
+                    .url("http://tele-oximeter-backend-development.up.railway.app/sessions")
                     .post("".toRequestBody("application/json".toMediaType()))
+                    .addHeader("Content-Type", "application/json")
                     .build()
                 
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) throw IOException("Unexpected code $response")
+                    // Log the response for debugging
+                    Log.d(TAG, "Session response code: ${response.code}")
+                    Log.d(TAG, "Session response body: ${response.body?.string()}")
+                    
+                    if (!response.isSuccessful) throw IOException("Request failed with code ${response.code}")
                     
                     // Parse the response
                     response.body?.string()?.let { 
