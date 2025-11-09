@@ -1,4 +1,6 @@
 
+// Revised MainActivity.kt that creates sessions directly in Supabase (no external /sessions endpoint).
+// Adjusts id types to Long, uses PostgREST select() to return inserted row.
 package com.example.testapplication_hrsp02
 
 import android.Manifest
@@ -42,17 +44,12 @@ import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.gotrue.Auth
 import io.github.jan.supabase.postgrest.Postgrest
 import io.github.jan.supabase.postgrest.from
+import io.github.jan.supabase.postgrest.result.PostgrestResult
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.FileWriter
 import java.io.IOException
@@ -60,23 +57,19 @@ import java.util.Collections
 import java.util.UUID
 import kotlin.math.min
 
-// ---------- Models ----------
-
 @Serializable
 data class SessionResponse(
-    val id: Int,
+    val id: Long,
     val session_key: String
 )
 
 @Serializable
 data class HealthData(
-    val session_id: Int,
+    val session_id: Long,
     val timestamp: Long,
     val pulse: Int,
     val spo2: Int
 )
-
-// ---------- Supabase ----------
 
 object SupabaseProvider {
     private const val URL = BuildConfig.SUPABASE_URL
@@ -91,68 +84,20 @@ object SupabaseProvider {
     }
 }
 
-// ---------- Backend (Railway) ----------
-
-object BackendConfig {
-    private const val BASE_URL = "https://tele-oximeter-backend-development.up.railway.app"
-    private val client = OkHttpClient()
-    private val json = Json { ignoreUnknownKeys = true }
-
-    fun createSession(): SessionResponse? {
-        val request = Request.Builder()
-            .url("$BASE_URL/sessions")
-            .post("".toRequestBody("application/json".toMediaType()))
-            .build()
-
-        return try {
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IOException("Unexpected code $response")
-                val body = response.body?.string() ?: return null
-                json.decodeFromString(SessionResponse.serializer(), body)
-            }
-        } catch (e: Exception) {
-            Log.e("Backend", "Failed to create session: ${e.message}", e)
-            null
-        }
-    }
-
-    fun uploadHealthData(data: List<HealthData>): Boolean {
-        val jsonData = Json.encodeToString(data)
-        val request = Request.Builder()
-            .url("$BASE_URL/health-data")
-            .post(jsonData.toRequestBody("application/json".toMediaType()))
-            .build()
-
-        return try {
-            client.newCall(request).execute().use { response ->
-                response.isSuccessful
-            }
-        } catch (e: Exception) {
-            Log.e("Backend", "Failed to upload health data: ${e.message}", e)
-            false
-        }
-    }
-}
-
-// ---------- Activity ----------
-
 class MainActivity : ComponentActivity() {
 
-    // ====== CONFIG ======
-    private val deviceName = "BLT_M70C"               // target BLE device name
-    private val knownServiceUuid: UUID? = null        // optional
-    private val knownNotifyCharUuid: UUID? = null     // optional
+    private val deviceName = "BLT_M70C"
+    private val knownServiceUuid: java.util.UUID? = null
+    private val knownNotifyCharUuid: java.util.UUID? = null
 
     private val WRITE_INTERVAL_SEC = 5
     private val BLE_WINDOW_MS = 25_000L
     private val TAG = "BLE_HR_SPO2"
 
-    // ====== BT / BLE ======
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private var bleScanner: BluetoothLeScanner? = null
     private var gatt: BluetoothGatt? = null
 
-    // ====== UI state ======
     private var status by mutableStateOf("Status: Idle")
     private var hrState by mutableStateOf("--")
     private var spo2State by mutableStateOf("--")
@@ -164,24 +109,20 @@ class MainActivity : ComponentActivity() {
 
     data class DiscoveredDevice(val address: String?, val name: String?, val rssi: Int?)
 
-    // ====== CSV ======
     private val buffer = Collections.synchronizedList(mutableListOf<Triple<Long, Int, Int>>())
     private var writerJob: Job? = null
     private var bleJob: Job? = null
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // ====== Continuous uploader ======
     private var uploaderJob: Job? = null
     private val uploadChan = Channel<Pair<Int, Int>>(
         capacity = 1000,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
-    // ====== Subscription queue ======
     private val descriptorQueue: ArrayDeque<Pair<BluetoothGattDescriptor, ByteArray>> = ArrayDeque()
-    private val subscribedCharUuids = Collections.synchronizedSet(mutableSetOf<UUID>())
+    private val subscribedCharUuids = Collections.synchronizedSet(mutableSetOf<java.util.UUID>())
 
-    // ====== Permissions ======
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
@@ -243,7 +184,6 @@ class MainActivity : ComponentActivity() {
         requestAllBtPerms()
     }
 
-    // ===== Permissions =====
     private fun requestAllBtPerms() {
         val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
@@ -284,10 +224,10 @@ class MainActivity : ComponentActivity() {
         if (!ensureEnvReady()) return
 
         ioScope.launch {
-            val created = withContext(Dispatchers.IO) { BackendConfig.createSession() }
+            val created = withContext(Dispatchers.IO) { createSessionInSupabase() }
             currentSession = created
             if (currentSession == null) {
-                updateStatus("Failed to create session")
+                updateStatus("Failed to create session in Supabase")
                 return@launch
             }
 
@@ -300,7 +240,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ===== UI actions =====
+    private suspend fun createSessionInSupabase(): SessionResponse? {
+        val key = (1..6).map { "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".random() }.joinToString("")
+        return try {
+            val res: PostgrestResult = SupabaseProvider.client
+                .from("sessions")
+                .insert(mapOf("session_key" to key)) { select() }
+            res.decodeSingle<SessionResponse>()
+        } catch (e: Exception) {
+            Log.e(TAG, "Supabase session insert failed: ${e.message}", e)
+            null
+        }
+    }
+
     private fun refreshBle() {
         stopBleScan()
         safeCloseGatt()
@@ -325,7 +277,6 @@ class MainActivity : ComponentActivity() {
         runCatching { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
     }
 
-    // ===== BLE scan =====
     @SuppressLint("MissingPermission")
     private fun startBleScanWindow() {
         if (!ensureEnvReady()) return
@@ -404,7 +355,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ===== GATT with robust subscription =====
     private val gattCallback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, statusCode: Int, newState: Int) {
@@ -479,7 +429,7 @@ class MainActivity : ComponentActivity() {
                     Log.w(TAG, "setCharacteristicNotification failed for ${ch.uuid}")
                     continue
                 }
-                val cccd = ch.getDescriptor(UUID.fromString(CCC_DESCRIPTOR_UUID))
+                val cccd = ch.getDescriptor(java.util.UUID.fromString(CCC_DESCRIPTOR_UUID))
                 if (cccd == null) {
                     Log.w(TAG, "CCCD not found for ${ch.uuid}")
                     continue
@@ -524,7 +474,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ===== Helper: write next descriptor in queue =====
     @SuppressLint("MissingPermission")
     private fun writeNextDescriptor(gatt: BluetoothGatt) {
         val next = descriptorQueue.removeFirstOrNull()
@@ -540,7 +489,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ===== Parse + logging =====
     private fun handleNotify(ch: BluetoothGattCharacteristic, bytes: ByteArray) {
         val n = min(bytes.size, 32)
         val hex = (0 until n).joinToString(" ") { i -> String.format("%02X", bytes[i]) }
@@ -581,7 +529,6 @@ class MainActivity : ComponentActivity() {
         return flags.joinToString("|")
     }
 
-    // ===== Frame parsing =====
     private fun parseFrame(bytes: ByteArray): Pair<Int, Int>? {
         if (bytes.size < 19) return null
         val raw = bytes.map { it.toInt() and 0xFF }
@@ -593,7 +540,6 @@ class MainActivity : ComponentActivity() {
         } else null
     }
 
-    // ===== CSV + Supabase =====
     private fun csvFile(): File = File(getExternalFilesDir(null), "health_data.csv")
 
     private fun ensureCsvHeader() {
@@ -682,7 +628,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ===== Supabase insert helper =====
     private suspend fun insertManyHealth(rows: List<HealthData>) {
         if (rows.isEmpty()) return
         try {
@@ -697,7 +642,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ===== Utils =====
     private fun safeCloseGatt() { runCatching { gatt?.close() }; gatt = null }
     private fun updateStatus(msg: String) { Log.d(TAG, msg); runOnUiThread { status = msg } }
 
