@@ -1,9 +1,23 @@
+
 package com.example.testapplication_hrsp02
 
 import android.Manifest
-import android.bluetooth.*
-import android.bluetooth.le.*
-import android.content.*
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.Build
@@ -11,12 +25,6 @@ import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.Dispatchers
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import kotlinx.serialization.json.Json
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -30,53 +38,91 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
+import io.github.jan.supabase.createSupabaseClient
+import io.github.jan.supabase.gotrue.Auth
+import io.github.jan.supabase.postgrest.Postgrest
+import io.github.jan.supabase.postgrest.from
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.FileWriter
 import java.io.IOException
-import java.util.*
+import java.util.Collections
+import java.util.UUID
 import kotlin.math.min
 
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.withTimeoutOrNull
+// ---------- Models ----------
 
-// Backend configuration
+@Serializable
+data class SessionResponse(
+    val id: Int,
+    val session_key: String
+)
+
+@Serializable
+data class HealthData(
+    val session_id: Int,
+    val timestamp: Long,
+    val pulse: Int,
+    val spo2: Int
+)
+
+// ---------- Supabase ----------
+
+object SupabaseProvider {
+    private const val URL = BuildConfig.SUPABASE_URL
+    private const val KEY = BuildConfig.SUPABASE_ANON_KEY
+
+    val client = createSupabaseClient(
+        supabaseUrl = URL,
+        supabaseKey = KEY
+    ) {
+        install(Postgrest)
+        install(Auth)
+    }
+}
+
+// ---------- Backend (Railway) ----------
+
 object BackendConfig {
-    const val BASE_URL = "https://tele-oximeter-backend-development.up.railway.app"
+    private const val BASE_URL = "https://tele-oximeter-backend-development.up.railway.app"
     private val client = OkHttpClient()
     private val json = Json { ignoreUnknownKeys = true }
-    
+
     fun createSession(): SessionResponse? {
         val request = Request.Builder()
             .url("$BASE_URL/sessions")
             .post("".toRequestBody("application/json".toMediaType()))
             .build()
-            
+
         return try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw IOException("Unexpected code $response")
-                response.body?.string()?.let { json.decodeFromString<SessionResponse>(it) }
+                val body = response.body?.string() ?: return null
+                json.decodeFromString(SessionResponse.serializer(), body)
             }
         } catch (e: Exception) {
             Log.e("Backend", "Failed to create session: ${e.message}", e)
             null
         }
     }
-    
+
     fun uploadHealthData(data: List<HealthData>): Boolean {
-        val jsonData = json.encodeToString(HealthData.serializer().list, data)
+        val jsonData = Json.encodeToString(data)
         val request = Request.Builder()
             .url("$BASE_URL/health-data")
             .post(jsonData.toRequestBody("application/json".toMediaType()))
             .build()
-            
+
         return try {
             client.newCall(request).execute().use { response ->
                 response.isSuccessful
@@ -88,91 +134,14 @@ object BackendConfig {
     }
 }
 
-// Supabase configuration
-import io.github.jan.supabase.createSupabaseClient
-import io.github.jan.supabase.postgrest.Postgrest
-import io.github.jan.supabase.gotrue.Auth
-import io.github.jan.supabase.postgrest.from
-
-// Initializes Supabase for data storage
-object SupabaseProvider {
-    private const val URL = BuildConfig.SUPABASE_URL
-    private const val KEY = BuildConfig.SUPABASE_ANON_KEY
-
-    val client = createSupabaseClient(
-        supabaseUrl = URL,
-        supabaseKey = KEY // anon key only; never service role in mobile apps
-    ) {
-        install(Postgrest)
-        install(Auth)
-    }
-}
-
-// Import models
-import com.example.testapplication_hrsp02.data.*
-import java.util.UUID
-
-// Session management
-private var currentSession: SessionResponse? = null
-
-// Create a new session
-    private suspend fun createSession(): SessionResponse? {
-        return withContext(Dispatchers.IO) {
-            try {
-                // Request session from Railway backend
-                val client = OkHttpClient.Builder()
-                    .build()
-                val request = Request.Builder()
-                    .url("http://tele-oximeter-backend-development.up.railway.app/sessions")
-                    .post("".toRequestBody("application/json".toMediaType()))
-                    .addHeader("Content-Type", "application/json")
-                    .build()
-                
-                client.newCall(request).execute().use { response ->
-                    // Log the response for debugging
-                    Log.d(TAG, "Session response code: ${response.code}")
-                    Log.d(TAG, "Session response body: ${response.body?.string()}")
-                    
-                    if (!response.isSuccessful) throw IOException("Request failed with code ${response.code}")
-                    
-                    // Parse the response
-                    response.body?.string()?.let { 
-                        Json { ignoreUnknownKeys = true }.decodeFromString<SessionResponse>(it)
-                    } ?: throw IOException("Empty response body")
-                }.also { response ->
-                    Log.d(TAG, "Session created successfully with key: ${response.session_key}")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to create session: ${e.message}", e)
-                null
-            }
-        }
-    }
-
-// Bulk insert helper
-private suspend fun insertManyHealth(rows: List<HealthData>) {
-    if (rows.isEmpty()) return
-    try {
-        Log.d(TAG, "Inserting ${rows.size} health records. First record: ${rows.firstOrNull()}")
-        // Use Supabase for data upload
-        SupabaseProvider.client
-            .from("health_data")
-            .insert(rows)
-        Log.d(TAG, "Successfully inserted ${rows.size} health records")
-    } catch (e: Exception) {
-        Log.e(TAG, "Failed to insert health data: ${e.message}", e)
-        throw e  // Re-throw to be caught by caller
-    }
-}
-
-// ===============================================================
+// ---------- Activity ----------
 
 class MainActivity : ComponentActivity() {
 
     // ====== CONFIG ======
     private val deviceName = "BLT_M70C"               // target BLE device name
-    private val knownServiceUuid: UUID? = null        // set once known (optional)
-    private val knownNotifyCharUuid: UUID? = null     // set once known (optional)
+    private val knownServiceUuid: UUID? = null        // optional
+    private val knownNotifyCharUuid: UUID? = null     // optional
 
     private val WRITE_INTERVAL_SEC = 5
     private val BLE_WINDOW_MS = 25_000L
@@ -203,12 +172,12 @@ class MainActivity : ComponentActivity() {
 
     // ====== Continuous uploader ======
     private var uploaderJob: Job? = null
-    private val uploadChan = Channel<Pair<Int, Int>>(  // (pulse, spo2)
+    private val uploadChan = Channel<Pair<Int, Int>>(
         capacity = 1000,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
-    // ====== Subscription queue (enable notifications on multiple chars safely) ======
+    // ====== Subscription queue ======
     private val descriptorQueue: ArrayDeque<Pair<BluetoothGattDescriptor, ByteArray>> = ArrayDeque()
     private val subscribedCharUuids = Collections.synchronizedSet(mutableSetOf<UUID>())
 
@@ -234,12 +203,12 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.padding(16.dp)) {
                     Text(status)
                     Spacer(Modifier.height(8.dp))
-                    
+
                     if (sessionKey.isNotBlank()) {
                         Text("Session Key: $sessionKey")
                         Spacer(Modifier.height(8.dp))
                     }
-                    
+
                     Row {
                         Button(onClick = { refreshBle() }) { Text("Refresh BLE") }
                         Spacer(Modifier.width(10.dp))
@@ -313,18 +282,18 @@ class MainActivity : ComponentActivity() {
 
     private fun startEnvironment() {
         if (!ensureEnvReady()) return
-        
+
         ioScope.launch {
-            currentSession = createSession()
+            val created = withContext(Dispatchers.IO) { BackendConfig.createSession() }
+            currentSession = created
             if (currentSession == null) {
                 updateStatus("Failed to create session")
                 return@launch
             }
-            
-            // Store and display the session key
+
             sessionKey = currentSession!!.session_key
             updateStatus("Session created - Key: $sessionKey")
-            
+
             startCsvWriterIfNeeded()
             startUploader()
             startBleScanWindow()
@@ -357,6 +326,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // ===== BLE scan =====
+    @SuppressLint("MissingPermission")
     private fun startBleScanWindow() {
         if (!ensureEnvReady()) return
         bleScanner = bluetoothAdapter.bluetoothLeScanner
@@ -389,6 +359,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun stopBleScan() {
         try { bleScanner?.stopScan(bleCallback) } catch (_: Exception) {}
         bleJob?.cancel()
@@ -403,12 +374,13 @@ class MainActivity : ComponentActivity() {
             stopBleScan()
         }
 
+        @SuppressLint("MissingPermission")
         private fun handleOne(result: ScanResult) {
             val dev = result.device ?: return
             val addr = runCatching { dev.address }.getOrNull()
             val name = result.scanRecord?.deviceName ?: runCatching { dev.name }.getOrNull()
             val rssi = result.rssi
-            val key = "${addr ?: name}:${rssi}"
+            val key = "${addr ?: name}:$rssi"
             scanEvents++
 
             if (seenKeys.add(key)) {
@@ -443,7 +415,6 @@ class MainActivity : ComponentActivity() {
                 BluetoothProfile.STATE_CONNECTED -> {
                     updateStatus("Connected — requesting MTU & high priority")
                     gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                    // MTU handshake, then discover
                     if (!gatt.requestMtu(247)) {
                         updateStatus("requestMtu failed; discovering services")
                         gatt.discoverServices()
@@ -554,8 +525,9 @@ class MainActivity : ComponentActivity() {
     }
 
     // ===== Helper: write next descriptor in queue =====
+    @SuppressLint("MissingPermission")
     private fun writeNextDescriptor(gatt: BluetoothGatt) {
-        val next = descriptorQueue.pollFirst()
+        val next = descriptorQueue.removeFirstOrNull()
         if (next == null) {
             updateStatus("Subscribed to ${subscribedCharUuids.size} characteristic(s)")
             return
@@ -579,21 +551,12 @@ class MainActivity : ComponentActivity() {
         hrState = hr.toString()
         spo2State = spo2.toString()
 
-        // Timestamp once
         val now = System.currentTimeMillis() / 1000L
-
-        // Keep CSV buffer
         buffer.add(Triple(now, hr, spo2))
 
-        // Only upload if we have an active session
         if (currentSession != null) {
             Log.d(TAG, "Enqueueing data: HR=$hr, SpO2=$spo2")
-            // Enqueue for continuous upload (non-blocking)
-            uploadChan.trySend(hr to spo2).also { result ->
-                if (!result.isSuccess) {
-                    Log.w(TAG, "Failed to enqueue data: ${result.exceptionOrNull()?.message}")
-                }
-            }
+            uploadChan.trySend(hr to spo2)
         } else {
             Log.w(TAG, "No active session, skipping upload of HR=$hr, SpO2=$spo2")
         }
@@ -618,7 +581,7 @@ class MainActivity : ComponentActivity() {
         return flags.joinToString("|")
     }
 
-    // ===== Frame parsing (same logic as your Python) =====
+    // ===== Frame parsing =====
     private fun parseFrame(bytes: ByteArray): Pair<Int, Int>? {
         if (bytes.size < 19) return null
         val raw = bytes.map { it.toInt() and 0xFF }
@@ -630,7 +593,7 @@ class MainActivity : ComponentActivity() {
         } else null
     }
 
-    // ===== CSV + Supabase (batch on disk, continuous via channel) =====
+    // ===== CSV + Supabase =====
     private fun csvFile(): File = File(getExternalFilesDir(null), "health_data.csv")
 
     private fun ensureCsvHeader() {
@@ -649,7 +612,6 @@ class MainActivity : ComponentActivity() {
             snapshot.addAll(buffer); buffer.clear()
         }
 
-        // Write CSV
         try {
             FileWriter(csvFile(), true).use { w ->
                 snapshot.forEach { (ts, hr, spo2) -> w.appendLine("$ts,$hr,$spo2") }
@@ -657,9 +619,11 @@ class MainActivity : ComponentActivity() {
             Log.d(TAG, "CSV appended ${snapshot.size} rows.")
         } catch (e: IOException) { Log.e(TAG, "CSV write failed", e) }
 
-        // ALSO send the same batch to Supabase (safety net)
+        val sid = currentSession?.id ?: return
         ioScope.launch {
-            val rows = snapshot.map { (ts, hr, sp) -> HealthRow(ts, hr, sp) }
+            val rows = snapshot.map { (ts, hr, sp) ->
+                HealthData(session_id = sid, timestamp = ts, pulse = hr, spo2 = sp)
+            }
             runCatching { insertManyHealth(rows) }
                 .onSuccess { Log.d(TAG, "Supabase: inserted ${rows.size} rows") }
                 .onFailure { err -> Log.w(TAG, "Supabase insert failed: ${err.message}", err) }
@@ -678,7 +642,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ===== Continuous uploader (flush every few seconds or max batch) =====
     private fun startUploader() {
         if (uploaderJob?.isActive == true) return
         uploaderJob = ioScope.launch {
@@ -692,11 +655,12 @@ class MainActivity : ComponentActivity() {
                 val item = withTimeoutOrNull(if (remaining > 0) remaining else 1L) {
                     uploadChan.receive()
                 }
-                
-                if (item != null && currentSession != null) {
+
+                val sid = currentSession?.id
+                if (item != null && sid != null) {
                     val (pulse, spo2) = item
                     batch += HealthData(
-                        session_id = currentSession!!.id,
+                        session_id = sid,
                         timestamp = System.currentTimeMillis() / 1000L,
                         pulse = pulse,
                         spo2 = spo2
@@ -718,6 +682,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ===== Supabase insert helper =====
+    private suspend fun insertManyHealth(rows: List<HealthData>) {
+        if (rows.isEmpty()) return
+        try {
+            Log.d(TAG, "Inserting ${rows.size} health records. First: ${rows.firstOrNull()}")
+            SupabaseProvider.client
+                .from("health_data")
+                .insert(rows)
+            Log.d(TAG, "Successfully inserted ${rows.size} health records")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to insert health data: ${e.message}", e)
+            throw e
+        }
+    }
+
     // ===== Utils =====
     private fun safeCloseGatt() { runCatching { gatt?.close() }; gatt = null }
     private fun updateStatus(msg: String) { Log.d(TAG, msg); runOnUiThread { status = msg } }
@@ -728,11 +707,12 @@ class MainActivity : ComponentActivity() {
         safeCloseGatt()
         writerJob?.cancel()
         bleJob?.cancel()
-        uploaderJob?.cancel()      // <-- stop uploader
+        uploaderJob?.cancel()
         ioScope.cancel()
     }
 
     companion object {
         private const val CCC_DESCRIPTOR_UUID = "00002902-0000-1000-8000-00805f9b34fb"
+        private var currentSession: SessionResponse? = null
     }
 }
