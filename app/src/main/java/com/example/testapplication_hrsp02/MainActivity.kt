@@ -33,18 +33,28 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
+import com.example.testapplication_hrsp02.BuildConfig
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.gotrue.Auth
 import io.github.jan.supabase.postgrest.Postgrest
 import io.github.jan.supabase.postgrest.from
 import io.github.jan.supabase.postgrest.result.PostgrestResult
+import io.ktor.client.*
+import io.ktor.client.engine.okhttp.*
+import io.ktor.client.plugins.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.http.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
@@ -93,15 +103,28 @@ class MainActivity : ComponentActivity() {
     private val WRITE_INTERVAL_SEC = 5
     private val BLE_WINDOW_MS = 25_000L
     private val TAG = "BLE_HR_SPO2"
+    
+    // Railway backend URL
+    private val API_URL = "https://tele-oximeter-backend-development.up.railway.app"
 
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private var bleScanner: BluetoothLeScanner? = null
     private var gatt: BluetoothGatt? = null
+    
+    private val httpClient = HttpClient(OkHttp) {
+        install(HttpTimeout) {
+            requestTimeoutMillis = 15000
+            connectTimeoutMillis = 15000
+            socketTimeoutMillis = 15000
+        }
+    }
 
     private var status by mutableStateOf("Status: Idle")
     private var hrState by mutableStateOf("--")
     private var spo2State by mutableStateOf("--")
     private var isScanningBle by mutableStateOf(false)
+    private var isConnected by mutableStateOf(false)
+    private var isStreaming by mutableStateOf(false)
     private var scanEvents by mutableStateOf(0)
     private var sessionKey by mutableStateOf("")
     private val discoveredDevices = mutableStateListOf<DiscoveredDevice>()
@@ -127,9 +150,10 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         if (results.values.any { !it }) {
-            updateStatus("Required permissions denied"); return@registerForActivityResult
+            updateStatus("Required permissions denied")
+        } else {
+            updateStatus("Permissions granted - Ready to connect")
         }
-        startEnvironment()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -140,48 +164,117 @@ class MainActivity : ComponentActivity() {
         bleScanner = bluetoothAdapter.bluetoothLeScanner
 
         setContent {
-            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                Column(Modifier.padding(16.dp)) {
-                    Text(status)
-                    Spacer(Modifier.height(8.dp))
-
-                    if (sessionKey.isNotBlank()) {
-                        Text("Session Key: $sessionKey")
-                        Spacer(Modifier.height(8.dp))
-                    }
-
-                    Row {
-                        Button(onClick = { refreshBle() }) { Text("Refresh BLE") }
-                        Spacer(Modifier.width(10.dp))
-                        Button(onClick = { clearList() }) { Text("Clear List") }
-                        Spacer(Modifier.width(10.dp))
-                        Button(onClick = { promptEnableBluetooth() }) { Text("Enable Bluetooth") }
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                            Spacer(Modifier.width(10.dp))
-                            Button(onClick = { openLocationSettings() }) { Text("Location Settings") }
-                        }
-                    }
-
-                    Spacer(Modifier.height(12.dp))
-                    Text("HR: $hrState")
-                    Text("SpO₂: $spo2State%")
-                    Spacer(Modifier.height(12.dp))
-                    Text("Nearby (live):")
-                    LazyColumn {
-                        items(discoveredDevices) { d ->
-                            Text(
-                                "• ${d.name ?: "(no name)"} — ${d.address ?: "unknown"} [RSSI ${d.rssi ?: "?"}]",
-                                Modifier.padding(top = 6.dp)
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text("Scan events: $scanEvents | Scanning: ${if (isScanningBle) "YES" else "NO"}")
+            MaterialTheme {
+                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    MainScreen()
                 }
             }
         }
 
         requestAllBtPerms()
+    }
+    
+    @Composable
+    fun MainScreen() {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                text = "Oximeter Data Streaming",
+                style = MaterialTheme.typography.headlineMedium,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+            
+            Text(status)
+            Spacer(Modifier.height(16.dp))
+
+            // Connection Status Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isConnected) Color(0xFFE8F5E9) else Color(0xFFFFF3E0)
+                )
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Bluetooth Status: ${if (isConnected) "✓ Connected" else "✗ Disconnected"}",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = if (isConnected) Color(0xFF2E7D32) else Color(0xFFE65100)
+                    )
+                    Text("HR: $hrState  |  SpO₂: $spo2State%")
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // Session Key Display
+            if (sessionKey.isNotBlank()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = Color(0xFFE3F2FD)
+                    )
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text(
+                            text = "Session Key:",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Color(0xFF1565C0)
+                        )
+                        Text(
+                            text = sessionKey,
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = Color(0xFF0D47A1)
+                        )
+                        if (isStreaming) {
+                            Text(
+                                text = "🔴 Streaming data to Railway + Supabase",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color(0xFFC62828),
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
+
+            // Main Control Buttons
+            Button(
+                onClick = { connectOximeter() },
+                enabled = !isConnected && !isScanningBle,
+                modifier = Modifier.fillMaxWidth().height(56.dp)
+            ) {
+                Text(
+                    text = if (isScanningBle) "Connecting..." else "1. Connect Oximeter",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Button(
+                onClick = { startStreaming() },
+                enabled = isConnected && !isStreaming,
+                modifier = Modifier.fillMaxWidth().height(56.dp)
+            ) {
+                Text(
+                    text = if (isStreaming) "Streaming Active" else "2. Start Streaming Data",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Button(
+                onClick = { stopStreaming() },
+                enabled = isStreaming,
+                modifier = Modifier.fillMaxWidth().height(56.dp)
+            ) {
+                Text(
+                    text = "Stop Streaming",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+        }
     }
 
     private fun requestAllBtPerms() {
@@ -191,6 +284,105 @@ class MainActivity : ComponentActivity() {
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         }
         permLauncher.launch(perms)
+    }
+    
+    private fun connectOximeter() {
+        if (!ensureEnvReady()) return
+        updateStatus("Searching for oximeter...")
+        startBleScanWindow()
+    }
+    
+    private fun startStreaming() {
+        if (!isConnected) {
+            updateStatus("Please connect oximeter first")
+            return
+        }
+        
+        isStreaming = true
+        updateStatus("Creating Railway session...")
+        
+        ioScope.launch {
+            // Create session on Railway
+            val railwaySessionKey = createRailwaySession()
+            
+            if (railwaySessionKey != null) {
+                // Create session in Supabase
+                val supabaseSession = createSessionInSupabase(railwaySessionKey)
+                
+                if (supabaseSession != null) {
+                    currentSession = supabaseSession
+                    withContext(Dispatchers.Main) {
+                        sessionKey = railwaySessionKey
+                        updateStatus("Streaming active - Session: $railwaySessionKey")
+                    }
+                    
+                    startCsvWriterIfNeeded()
+                    startUploader()
+                } else {
+                    withContext(Dispatchers.Main) {
+                        isStreaming = false
+                        updateStatus("Failed to create Supabase session")
+                    }
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    isStreaming = false
+                    updateStatus("Failed to create Railway session")
+                }
+            }
+        }
+    }
+    
+    private fun stopStreaming() {
+        isStreaming = false
+        sessionKey = ""
+        currentSession = null
+        writerJob?.cancel()
+        uploaderJob?.cancel()
+        updateStatus("Streaming stopped")
+    }
+    
+    private suspend fun createRailwaySession(): String? {
+        return try {
+            Log.d(TAG, "Requesting new session from: $API_URL/session/new")
+            
+            val response: HttpResponse = httpClient.post("$API_URL/session/new")
+            val responseBody = response.bodyAsText()
+            
+            Log.d(TAG, "Railway Response: ${response.status.value} - $responseBody")
+            
+            if (response.status.value in 200..299) {
+                // Parse JSON response - extract session_key
+                val regex = """"session_key"\s*:\s*"([^"]+)"""".toRegex()
+                val key = regex.find(responseBody)?.groupValues?.get(1)
+                
+                if (key != null) {
+                    Log.d(TAG, "Railway session created: $key")
+                    key
+                } else {
+                    Log.e(TAG, "Could not parse session_key from response")
+                    null
+                }
+            } else {
+                Log.e(TAG, "Railway session creation failed: ${response.status}")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating Railway session: ${e.message}", e)
+            null
+        }
+    }
+    
+    private suspend fun createSessionInSupabase(railwayKey: String): SessionResponse? {
+        return try {
+            val res: PostgrestResult = SupabaseProvider.client
+                .from("sessions")
+                .insert(mapOf("session_key" to railwayKey)) { select() }
+            res.decodeSingle<SessionResponse>()
+        } catch (e: Exception) {
+            Log.e(TAG, "Supabase session insert failed: ${e.message}", e)
+            null
+        }
     }
 
     private fun hasPerm(p: String) =
@@ -220,42 +412,10 @@ class MainActivity : ComponentActivity() {
         else lm.getProviders(true).isNotEmpty()
     } catch (_: Exception) { true }
 
-    private fun startEnvironment() {
-        if (!ensureEnvReady()) return
-
-        ioScope.launch {
-            val created = withContext(Dispatchers.IO) { createSessionInSupabase() }
-            currentSession = created
-            if (currentSession == null) {
-                updateStatus("Failed to create session in Supabase")
-                return@launch
-            }
-
-            sessionKey = currentSession!!.session_key
-            updateStatus("Session created - Key: $sessionKey")
-
-            startCsvWriterIfNeeded()
-            startUploader()
-            startBleScanWindow()
-        }
-    }
-
-    private suspend fun createSessionInSupabase(): SessionResponse? {
-        val key = (1..6).map { "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".random() }.joinToString("")
-        return try {
-            val res: PostgrestResult = SupabaseProvider.client
-                .from("sessions")
-                .insert(mapOf("session_key" to key)) { select() }
-            res.decodeSingle<SessionResponse>()
-        } catch (e: Exception) {
-            Log.e(TAG, "Supabase session insert failed: ${e.message}", e)
-            null
-        }
-    }
-
     private fun refreshBle() {
         stopBleScan()
         safeCloseGatt()
+        isConnected = false
         hrState = "--"; spo2State = "--"
         scanEvents = 0
         updateStatus("Refreshing BLE…")
@@ -363,6 +523,7 @@ class MainActivity : ComponentActivity() {
             }
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    isConnected = true
                     updateStatus("Connected — requesting MTU & high priority")
                     gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                     if (!gatt.requestMtu(247)) {
@@ -371,6 +532,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
+                    isConnected = false
                     updateStatus("Disconnected")
                     safeCloseGatt()
                 }
@@ -645,6 +807,7 @@ class MainActivity : ComponentActivity() {
     private fun safeCloseGatt() { runCatching { gatt?.close() }; gatt = null }
     private fun updateStatus(msg: String) { Log.d(TAG, msg); runOnUiThread { status = msg } }
 
+    @SuppressLint("MissingPermission")
     override fun onDestroy() {
         super.onDestroy()
         try { bleScanner?.stopScan(bleCallback) } catch (_: Exception) {}
@@ -653,6 +816,7 @@ class MainActivity : ComponentActivity() {
         bleJob?.cancel()
         uploaderJob?.cancel()
         ioScope.cancel()
+        httpClient.close()
     }
 
     companion object {
