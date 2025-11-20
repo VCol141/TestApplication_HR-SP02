@@ -375,12 +375,16 @@ class MainActivity : ComponentActivity() {
     
     private suspend fun createSessionInSupabase(railwayKey: String): SessionResponse? {
         return try {
+            Log.d(TAG, "Creating Supabase session with key: $railwayKey")
             val res: PostgrestResult = SupabaseProvider.client
                 .from("sessions")
                 .insert(mapOf("session_key" to railwayKey)) { select() }
-            res.decodeSingle<SessionResponse>()
+            val session = res.decodeSingle<SessionResponse>()
+            Log.d(TAG, "Supabase session created: id=${session.id}, key=${session.session_key}")
+            session
         } catch (e: Exception) {
             Log.e(TAG, "Supabase session insert failed: ${e.message}", e)
+            e.printStackTrace()
             null
         }
     }
@@ -664,11 +668,11 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis() / 1000L
         buffer.add(Triple(now, hr, spo2))
 
-        if (currentSession != null) {
-            Log.d(TAG, "Enqueueing data: HR=$hr, SpO2=$spo2")
+        if (isStreaming && currentSession != null) {
+            Log.d(TAG, "Enqueueing data for session ${currentSession!!.id}: HR=$hr, SpO2=$spo2")
             uploadChan.trySend(hr to spo2)
         } else {
-            Log.w(TAG, "No active session, skipping upload of HR=$hr, SpO2=$spo2")
+            Log.w(TAG, "Not streaming (streaming=$isStreaming, session=${currentSession?.id}), skipping upload of HR=$hr, SpO2=$spo2")
         }
     }
 
@@ -751,21 +755,25 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startUploader() {
-        if (uploaderJob?.isActive == true) return
+        if (uploaderJob?.isActive == true) {
+            Log.d(TAG, "Uploader already active")
+            return
+        }
+        Log.d(TAG, "Starting uploader for session ${currentSession?.id}")
         uploaderJob = ioScope.launch {
             val batch = mutableListOf<HealthData>()
             val FLUSH_MS = 3000L
             val MAX_BATCH = 50
             var lastFlush = System.currentTimeMillis()
 
-            while (isActive) {
+            while (isActive && isStreaming) {
                 val remaining = FLUSH_MS - (System.currentTimeMillis() - lastFlush)
                 val item = withTimeoutOrNull(if (remaining > 0) remaining else 1L) {
                     uploadChan.receive()
                 }
 
                 val sid = currentSession?.id
-                if (item != null && sid != null) {
+                if (item != null && sid != null && isStreaming) {
                     val (pulse, spo2) = item
                     batch += HealthData(
                         session_id = sid,
@@ -773,20 +781,23 @@ class MainActivity : ComponentActivity() {
                         pulse = pulse,
                         spo2 = spo2
                     )
+                    Log.d(TAG, "Batched data point: HR=$pulse, SpO2=$spo2 (batch size: ${batch.size})")
                 }
 
                 val timeFlush = System.currentTimeMillis() - lastFlush >= FLUSH_MS
                 val sizeFlush = batch.size >= MAX_BATCH
 
-                if ((timeFlush || sizeFlush) && batch.isNotEmpty()) {
+                if ((timeFlush || sizeFlush) && batch.isNotEmpty() && isStreaming) {
                     val toSend = batch.toList()
                     batch.clear()
                     lastFlush = System.currentTimeMillis()
+                    Log.d(TAG, "Uploading ${toSend.size} records to Supabase...")
                     runCatching { insertManyHealth(toSend) }
-                        .onSuccess { Log.d(TAG, "Supabase: sent ${toSend.size} rows") }
-                        .onFailure { e -> Log.w(TAG, "Supabase batch failed: ${e.message}", e) }
+                        .onSuccess { Log.d(TAG, "Supabase: successfully sent ${toSend.size} rows") }
+                        .onFailure { e -> Log.e(TAG, "Supabase batch failed: ${e.message}", e); e.printStackTrace() }
                 }
             }
+            Log.d(TAG, "Uploader stopped")
         }
     }
 
